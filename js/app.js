@@ -57,7 +57,6 @@ async function startBook() {
 
     const renderedPages = new Set();
     const renderJobs = new Map();
-    const linkedContentsPages = new Set();
 
     async function renderPage(pageNumber) {
         if (renderedPages.has(pageNumber)) return;
@@ -97,153 +96,6 @@ async function startBook() {
             jobs.push(renderPage(pageNumber));
         }
         await Promise.all(jobs);
-    }
-
-    function groupTextRows(items) {
-        const rows = [];
-        for (const item of items) {
-            if (!item.str?.trim() || !item.width) continue;
-            const baseline = item.transform[5];
-            let row = rows.find(candidate => Math.abs(candidate.baseline - baseline) < 2.5);
-            if (!row) {
-                row = { baseline, items: [] };
-                rows.push(row);
-            }
-            row.items.push(item);
-        }
-        for (const row of rows) {
-            row.items.sort((a, b) => a.transform[4] - b.transform[4]);
-        }
-        return rows;
-    }
-
-    function getPageNumberFromLabels(label, pageLabels) {
-        if (!/^\d+$/.test(label)) return Number(label);
-        const labelledIndex = pageLabels?.indexOf(label) ?? -1;
-        return labelledIndex >= 0 ? labelledIndex + 1 : Number(label);
-    }
-
-    function addContentsLinks(pageNumber, entries) {
-        if (linkedContentsPages.has(pageNumber) || entries.length === 0) return;
-        const pageElement = book.children[pageNumber - 1];
-        const layer = document.createElement("div");
-        layer.className = "contents-link-layer";
-        layer.setAttribute("aria-label", "Ссылки на страницы книги");
-
-        for (const entry of entries) {
-            const link = document.createElement("a");
-            link.className = "contents-link";
-            link.href = `#page-${entry.destinationPage}`;
-            link.title = `Перейти к странице ${entry.label}`;
-            link.setAttribute("aria-label", `Перейти к странице ${entry.label}`);
-            link.style.left = `${entry.left}%`;
-            link.style.top = `${entry.top}%`;
-            link.style.width = `${entry.width}%`;
-            link.style.height = `${entry.height}%`;
-
-            for (const eventName of ["pointerdown", "mousedown", "touchstart"]) {
-                link.addEventListener(eventName, event => event.stopPropagation());
-            }
-            link.addEventListener("click", async event => {
-                event.preventDefault();
-                event.stopPropagation();
-                await renderRange(entry.destinationPage - 1, entry.destinationPage + 4);
-                pageFlip.turnToPage(entry.destinationPage - 1);
-                updateCounter();
-                prepareAroundCurrentPage().catch(error => {
-                    console.error("Не удалось подготовить страницы книги:", error);
-                });
-            });
-            layer.appendChild(link);
-        }
-
-        pageElement.appendChild(layer);
-        linkedContentsPages.add(pageNumber);
-    }
-
-    async function scanForContents() {
-        let pageLabels = null;
-        try {
-            pageLabels = await pdf.getPageLabels();
-        } catch (error) {
-            console.info("Метки страниц PDF недоступны; использую номера из содержания.");
-        }
-
-        const batchSize = 4;
-        for (let firstPage = 1; firstPage <= pdf.numPages; firstPage += batchSize) {
-            const pageNumbers = Array.from(
-                { length: Math.min(batchSize, pdf.numPages - firstPage + 1) },
-                (_, index) => firstPage + index
-            );
-            const results = await Promise.all(pageNumbers.map(async pageNumber => {
-                try {
-                    const pdfPage = await pdf.getPage(pageNumber);
-                    const viewport = pdfPage.getViewport({ scale: 1 });
-                    const textContent = await pdfPage.getTextContent();
-                    const rows = groupTextRows(textContent.items);
-                    const candidates = [];
-
-                    for (const row of rows) {
-                        const lineText = row.items.map(item => item.str).join(" ").trim();
-                        const pageMatch = lineText.match(/(?:^|\s)(\d{1,4})\s*$/);
-                        if (!pageMatch) continue;
-
-                        const label = pageMatch[1];
-                        const destinationPage = getPageNumberFromLabels(label, pageLabels);
-                        if (!Number.isInteger(destinationPage) || destinationPage < 1 || destinationPage > pdf.numPages) continue;
-
-                        const left = Math.min(...row.items.map(item => item.transform[4]));
-                        const right = Math.max(...row.items.map(item => item.transform[4] + item.width));
-                        const bottom = Math.min(...row.items.map(item => item.transform[5]));
-                        const top = Math.max(...row.items.map(item => item.transform[5] + item.height));
-                        const dotCount = (lineText.match(/[.·…]/g) || []).length;
-                        const rect = viewport.convertToViewportRectangle([
-                            left - 3,
-                            bottom - 2,
-                            right + 3,
-                            top + 2
-                        ]);
-                        const x = Math.min(rect[0], rect[2]);
-                        const y = Math.min(rect[1], rect[3]);
-                        const width = Math.abs(rect[2] - rect[0]);
-                        const height = Math.abs(rect[3] - rect[1]);
-                        candidates.push({
-                            label,
-                            destinationPage,
-                            left: (x / viewport.width) * 100,
-                            top: (y / viewport.height) * 100,
-                            width: (width / viewport.width) * 100,
-                            height: (height / viewport.height) * 100,
-                            hasLeader: dotCount >= 5,
-                            rightAligned: right >= viewport.width * 0.62
-                        });
-                    }
-
-                    const leaderRows = candidates.filter(entry => entry.hasLeader).length;
-                    const alignedRows = candidates.filter(entry => entry.rightAligned).length;
-                    const pageText = textContent.items.map(item => item.str).join(" ").toLowerCase();
-                    const hasContentsHeading = /оглавление|краткое содержание|содержание|table\s+of\s+contents|contents/.test(pageText);
-                    const looksLikeContents = candidates.length >= 4 && (
-                        leaderRows >= 3 ||
-                        (hasContentsHeading && alignedRows >= 3) ||
-                        (candidates.length >= 7 && alignedRows >= 6)
-                    );
-
-                    return looksLikeContents
-                        ? { pageNumber, entries: candidates }
-                        : null;
-                } catch (error) {
-                    console.warn(`Не удалось просканировать PDF-страницу ${pageNumber}:`, error);
-                    return null;
-                }
-            }));
-
-            for (const result of results) {
-                if (!result) continue;
-                addContentsLinks(result.pageNumber, result.entries);
-            }
-            await new Promise(resolve => setTimeout(resolve, 0));
-        }
     }
 
     function releaseDistantPages(currentPageNumber) {
@@ -389,9 +241,6 @@ async function startBook() {
     status.textContent = `Готово к чтению · ${pdf.numPages} стр.`;
     prepareAroundCurrentPage().catch(error => {
         console.error("Не удалось подготовить страницы книги:", error);
-    });
-    scanForContents().catch(error => {
-        console.warn("Не удалось найти содержание книги:", error);
     });
 }
 
