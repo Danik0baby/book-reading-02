@@ -57,6 +57,7 @@ async function startBook() {
 
     const renderedPages = new Set();
     const renderJobs = new Map();
+    const linkedPages = new Set();
 
     async function renderPage(pageNumber) {
         if (renderedPages.has(pageNumber)) return;
@@ -73,6 +74,11 @@ async function startBook() {
             try {
                 await pdfPage.render({ canvasContext: context, viewport }).promise;
                 renderedPages.add(pageNumber);
+                try {
+                    await addPdfLinks(pageNumber, pdfPage, viewport);
+                } catch (error) {
+                    console.warn(`Не удалось подключить ссылки PDF-страницы ${pageNumber}:`, error);
+                }
             } catch (error) {
                 canvas.width = 0;
                 canvas.height = 0;
@@ -86,6 +92,88 @@ async function startBook() {
         } finally {
             renderJobs.delete(pageNumber);
         }
+    }
+
+    async function addPdfLinks(pageNumber, pdfPage, viewport) {
+        if (linkedPages.has(pageNumber)) return;
+
+        const annotations = await pdfPage.getAnnotations({ intent: "display" });
+        const links = annotations.filter(annotation =>
+            annotation.annotationType === pdfjsLib.AnnotationType.LINK ||
+            annotation.subtype === "Link"
+        );
+        const pageElement = book.children[pageNumber - 1];
+        const layer = document.createElement("div");
+        layer.className = "pdf-link-layer";
+        layer.setAttribute("aria-label", "Ссылки PDF-страницы");
+
+        for (const annotation of links) {
+            if (!annotation.rect) continue;
+            const [x1, y1, x2, y2] = annotation.rect;
+            const [a, b, c, d, e, f] = viewport.transform;
+            const corners = [
+                [x1, y1], [x1, y2], [x2, y1], [x2, y2]
+            ].map(([x, y]) => [a * x + c * y + e, b * x + d * y + f]);
+            const left = Math.min(...corners.map(point => point[0]));
+            const top = Math.min(...corners.map(point => point[1]));
+            const width = Math.max(...corners.map(point => point[0])) - left;
+            const height = Math.max(...corners.map(point => point[1])) - top;
+            const link = document.createElement("a");
+            link.className = "pdf-link";
+            link.style.left = `${(left / viewport.width) * 100}%`;
+            link.style.top = `${(top / viewport.height) * 100}%`;
+            link.style.width = `${(width / viewport.width) * 100}%`;
+            link.style.height = `${(height / viewport.height) * 100}%`;
+            for (const eventName of ["pointerdown", "mousedown", "touchstart"]) {
+                link.addEventListener(eventName, event => event.stopPropagation());
+            }
+
+            if (annotation.url) {
+                link.href = annotation.url;
+                link.target = "_blank";
+                link.rel = "noopener noreferrer";
+                link.setAttribute("aria-label", annotation.title || "Открыть ссылку из PDF");
+            } else if (annotation.dest) {
+                let destination = annotation.dest;
+                if (typeof destination === "string") {
+                    destination = await pdf.getDestination(destination);
+                }
+                if (!Array.isArray(destination) || destination.length === 0) continue;
+
+                let destinationIndex;
+                try {
+                    destinationIndex = typeof destination[0] === "number"
+                        ? destination[0]
+                        : await pdf.getPageIndex(destination[0]);
+                } catch (error) {
+                    console.warn("Не удалось определить страницу PDF-ссылки:", error);
+                    continue;
+                }
+                const destinationPage = destinationIndex + 1;
+                if (destinationPage < 1 || destinationPage > pdf.numPages) continue;
+
+                link.href = `#page-${destinationPage}`;
+                link.title = `Перейти к странице ${destinationPage}`;
+                link.setAttribute("aria-label", `Перейти к странице ${destinationPage}`);
+                link.addEventListener("click", async event => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    await renderRange(destinationPage - 1, destinationPage + 4);
+                    pageFlip.turnToPage(destinationPage - 1);
+                    updateCounter();
+                    prepareAroundCurrentPage().catch(error => {
+                        console.error("Не удалось подготовить страницы книги:", error);
+                    });
+                });
+            } else {
+                continue;
+            }
+
+            layer.appendChild(link);
+        }
+
+        if (layer.childElementCount > 0) pageElement.appendChild(layer);
+        linkedPages.add(pageNumber);
     }
 
     async function renderRange(firstPage, lastPage) {
