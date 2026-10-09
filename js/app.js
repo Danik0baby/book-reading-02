@@ -98,11 +98,12 @@ async function startBook() {
         if (linkedPages.has(pageNumber)) return;
 
         const annotations = await pdfPage.getAnnotations({ intent: "display" });
+        const textContent = await pdfPage.getTextContent();
         const links = annotations.filter(annotation =>
             annotation.annotationType === pdfjsLib.AnnotationType.LINK ||
             annotation.subtype === "Link"
         );
-        const pageElement = book.children[pageNumber - 1];
+        const pageElement = canvases[pageNumber - 1].parentElement;
         const layer = document.createElement("div");
         layer.className = "pdf-link-layer";
         layer.setAttribute("aria-label", "Ссылки PDF-страницы");
@@ -170,6 +171,69 @@ async function startBook() {
             }
 
             layer.appendChild(link);
+        }
+
+        const textItems = textContent.items.filter(item => item.str?.trim() && item.width > 0);
+        const continuationItems = new Set();
+        for (const item of textItems) {
+            if (continuationItems.has(item)) continue;
+            const matches = [...item.str.matchAll(/https?:\/\/[^\s<>"']+/gi)];
+            for (const match of matches) {
+                let url = match[0].replace(/[.,;!?]+$/g, "");
+                if (!/^https?:\/\//i.test(url)) continue;
+
+                const hitItems = [item];
+                let lastItem = item;
+                while (url.endsWith("-")) {
+                    const continuation = textItems
+                        .filter(candidate =>
+                            !continuationItems.has(candidate) &&
+                            !hitItems.includes(candidate) &&
+                            Math.abs(candidate.transform[4] - lastItem.transform[4]) < 4 &&
+                            candidate.transform[5] < lastItem.transform[5] &&
+                            lastItem.transform[5] - candidate.transform[5] <= Math.max(lastItem.height * 1.8, 20) &&
+                            /^[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+$/.test(candidate.str.trim())
+                        )
+                        .sort((a, b) => b.transform[5] - a.transform[5])[0];
+                    if (!continuation) break;
+                    const continuationText = continuation.str.trim();
+                    url += continuationText;
+                    hitItems.push(continuation);
+                    continuationItems.add(continuation);
+                    lastItem = continuation;
+                }
+
+                for (const hitItem of hitItems) {
+                    const x1 = hitItem.transform[4];
+                    const y1 = hitItem.transform[5];
+                    const rect = [x1, y1, x1 + hitItem.width, y1 + hitItem.height];
+                    const [a, b, c, d, e, f] = viewport.transform;
+                    const corners = [
+                        [rect[0], rect[1]], [rect[0], rect[3]],
+                        [rect[2], rect[1]], [rect[2], rect[3]]
+                    ].map(([x, y]) => [a * x + c * y + e, b * x + d * y + f]);
+                    const left = Math.min(...corners.map(point => point[0]));
+                    const top = Math.min(...corners.map(point => point[1]));
+                    const width = Math.max(...corners.map(point => point[0])) - left;
+                    const height = Math.max(...corners.map(point => point[1])) - top;
+                    const urlLink = document.createElement("a");
+                    urlLink.className = "pdf-link";
+                    urlLink.href = url;
+                    urlLink.target = "_blank";
+                    urlLink.rel = "noopener noreferrer";
+                    urlLink.title = url;
+                    urlLink.setAttribute("aria-label", `Открыть внешний источник: ${url}`);
+                    urlLink.style.left = `${(left / viewport.width) * 100}%`;
+                    urlLink.style.top = `${(top / viewport.height) * 100}%`;
+                    urlLink.style.width = `${(width / viewport.width) * 100}%`;
+                    urlLink.style.height = `${(height / viewport.height) * 100}%`;
+                    for (const eventName of ["pointerdown", "mousedown", "touchstart"]) {
+                        urlLink.addEventListener(eventName, event => event.stopPropagation());
+                    }
+                    urlLink.addEventListener("click", event => event.stopPropagation());
+                    layer.appendChild(urlLink);
+                }
+            }
         }
 
         if (layer.childElementCount > 0) pageElement.appendChild(layer);
