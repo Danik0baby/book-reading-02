@@ -208,6 +208,11 @@ body {
     transform: scale(0.94);
 }
 
+.toolbar button:disabled {
+    opacity: 0.35;
+    cursor: default;
+}
+
 .toolbar button[aria-pressed="false"] {
     color: #81796e;
 }

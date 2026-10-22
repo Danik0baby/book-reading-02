@@ -1,433 +1,227 @@
-import * as pdfjsLib from "../node_modules/pdfjs-dist/build/pdf.mjs";
+import * as pdfjsLib from "../vendor/pdfjs/6.4.299/pdf.min.mjs";
+import { openPdfSource } from "./pdf-source.js";
+import { createPageRenderer } from "./page-renderer.js";
+import { createLinkLayer } from "./pdf-links.js";
 
-// Worker paths are resolved relative to index.html.
-pdfjsLib.GlobalWorkerOptions.workerSrc =
-    "./node_modules/pdfjs-dist/build/pdf.worker.mjs";
+const runtimeUrl = new URL("../vendor/pdfjs/6.4.299/", import.meta.url);
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("pdf.worker.min.mjs", runtimeUrl).href;
 
-async function startBook() {
-    let soundEnabled = true;
-
-    // Public-domain recording: Wikimedia Commons, "Turning a page.ogg".
-    const pageTurnSounds = Array.from({ length: 3 }, () => {
-        const sound = new Audio("./assets/sounds/turning-a-page.ogg");
-        sound.preload = "auto";
-        sound.volume = 0.42;
-        return sound;
-    });
-    let pageTurnSoundIndex = 0;
-
-    function playPageTurnSound() {
-        if (!soundEnabled || pageTurnSounds.length === 0) return;
-
-        const sound = pageTurnSounds[pageTurnSoundIndex];
-        pageTurnSoundIndex = (pageTurnSoundIndex + 1) % pageTurnSounds.length;
-        sound.pause();
-        sound.currentTime = 0;
-        sound.playbackRate = 0.94 + Math.random() * 0.12;
-        sound.volume = 0.36 + Math.random() * 0.12;
-        sound.play().catch(error => {
-            console.warn("Не удалось воспроизвести звук страницы:", error);
-        });
-    }
-
-    // Cloudflare Pages handles cache validation with ETags. Keep a stable URL
-    // so the browser and edge cache can reuse the PDF between visits.
-    const pdfUrl = new URL("./book/backend.pdf", window.location.href);
+export async function startBook() {
     const status = document.getElementById("status");
-    status.textContent = "Загружаю PDF…";
-    const isCloudflarePages = window.location.hostname.endsWith(".pages.dev");
-    // Pages does not return 206 for Range requests. Use a normal stream there;
-    // local servers can use byte ranges and avoid fetching the whole PDF early.
-    const loadingTask = pdfjsLib.getDocument({
-        url: pdfUrl.href,
-        disableRange: isCloudflarePages,
-        disableStream: isCloudflarePages,
-        disableAutoFetch: !isCloudflarePages
-    });
-    loadingTask.onProgress = ({ loaded, total }) => {
-        if (total > 0) {
-            const percent = Math.min(100, Math.round((loaded / total) * 100));
-            status.textContent = `Загружаю PDF… ${percent}%`;
-        } else if (loaded > 0) {
-            status.textContent = `Загружаю PDF… ${Math.ceil(loaded / 1024)} КБ`;
-        }
-    };
-    const pdf = await loadingTask.promise;
-    status.textContent = "Подготавливаю первые страницы…";
-
     const book = document.getElementById("book");
-    const canvases = [];
-
-    // Build lightweight page shells; only nearby pages get rasterized.
-    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
-        const pageElement = document.createElement("div");
-        pageElement.className = "page";
-        pageElement.dataset.pageNumber = pageNumber;
-
-        const canvas = document.createElement("canvas");
-        canvas.width = 0;
-        canvas.height = 0;
-        pageElement.appendChild(canvas);
-        book.appendChild(pageElement);
-        canvases.push(canvas);
-    }
-
-    const renderedPages = new Set();
-    const renderJobs = new Map();
-    const linkedPages = new Set();
-    const pageProxies = new Map();
-
-    async function renderPage(pageNumber) {
-        if (renderedPages.has(pageNumber)) return;
-        if (renderJobs.has(pageNumber)) return renderJobs.get(pageNumber);
-
-        const job = (async () => {
-            const pdfPage = await pdf.getPage(pageNumber);
-            pageProxies.set(pageNumber, pdfPage);
-            const viewport = pdfPage.getViewport({ scale: 1.5 });
-            const canvas = canvases[pageNumber - 1];
-            const context = canvas.getContext("2d");
-
-            canvas.width = viewport.width;
-            canvas.height = viewport.height;
-            try {
-                await pdfPage.render({ canvasContext: context, viewport }).promise;
-                renderedPages.add(pageNumber);
-                try {
-                    await addPdfLinks(pageNumber, pdfPage, viewport);
-                } catch (error) {
-                    console.warn(`Не удалось подключить ссылки PDF-страницы ${pageNumber}:`, error);
-                }
-            } catch (error) {
-                canvas.width = 0;
-                canvas.height = 0;
-                throw error;
-            }
-        })();
-
-        renderJobs.set(pageNumber, job);
-        try {
-            await job;
-        } finally {
-            renderJobs.delete(pageNumber);
-        }
-    }
-
-    async function addPdfLinks(pageNumber, pdfPage, viewport) {
-        if (linkedPages.has(pageNumber)) return;
-
-        const annotations = await pdfPage.getAnnotations({ intent: "display" });
-        const textContent = await pdfPage.getTextContent();
-        const links = annotations.filter(annotation =>
-            annotation.annotationType === pdfjsLib.AnnotationType.LINK ||
-            annotation.subtype === "Link"
-        );
-        const pageElement = canvases[pageNumber - 1].parentElement;
-        const layer = document.createElement("div");
-        layer.className = "pdf-link-layer";
-        layer.setAttribute("aria-label", "Ссылки PDF-страницы");
-
-        for (const annotation of links) {
-            if (!annotation.rect) continue;
-            const [x1, y1, x2, y2] = annotation.rect;
-            const [a, b, c, d, e, f] = viewport.transform;
-            const corners = [
-                [x1, y1], [x1, y2], [x2, y1], [x2, y2]
-            ].map(([x, y]) => [a * x + c * y + e, b * x + d * y + f]);
-            const left = Math.min(...corners.map(point => point[0]));
-            const top = Math.min(...corners.map(point => point[1]));
-            const width = Math.max(...corners.map(point => point[0])) - left;
-            const height = Math.max(...corners.map(point => point[1])) - top;
-            const link = document.createElement("a");
-            link.className = "pdf-link";
-            link.style.left = `${(left / viewport.width) * 100}%`;
-            link.style.top = `${(top / viewport.height) * 100}%`;
-            link.style.width = `${(width / viewport.width) * 100}%`;
-            link.style.height = `${(height / viewport.height) * 100}%`;
-            for (const eventName of ["pointerdown", "mousedown", "touchstart"]) {
-                link.addEventListener(eventName, event => event.stopPropagation());
-            }
-
-            if (annotation.url) {
-                link.href = annotation.url;
-                link.target = "_blank";
-                link.rel = "noopener noreferrer";
-                link.setAttribute("aria-label", annotation.title || "Открыть ссылку из PDF");
-            } else if (annotation.dest) {
-                let destination = annotation.dest;
-                if (typeof destination === "string") {
-                    destination = await pdf.getDestination(destination);
-                }
-                if (!Array.isArray(destination) || destination.length === 0) continue;
-
-                let destinationIndex;
-                try {
-                    destinationIndex = typeof destination[0] === "number"
-                        ? destination[0]
-                        : await pdf.getPageIndex(destination[0]);
-                } catch (error) {
-                    console.warn("Не удалось определить страницу PDF-ссылки:", error);
-                    continue;
-                }
-                const destinationPage = destinationIndex + 1;
-                if (destinationPage < 1 || destinationPage > pdf.numPages) continue;
-
-                link.href = `#page-${destinationPage}`;
-                link.title = `Перейти к странице ${destinationPage}`;
-                link.setAttribute("aria-label", `Перейти к странице ${destinationPage}`);
-                link.addEventListener("click", async event => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    await renderRange(destinationPage, destinationPage);
-                    pageFlip.turnToPage(destinationPage - 1);
-                    updateCounter();
-                    prepareAroundCurrentPage().catch(error => {
-                        console.error("Не удалось подготовить страницы книги:", error);
-                    });
-                });
-            } else {
-                continue;
-            }
-
-            layer.appendChild(link);
-        }
-
-        const textItems = textContent.items.filter(item => item.str?.trim() && item.width > 0);
-        const continuationItems = new Set();
-        for (const item of textItems) {
-            if (continuationItems.has(item)) continue;
-            const matches = [...item.str.matchAll(/https?:\/\/[^\s<>"']+/gi)];
-            for (const match of matches) {
-                let url = match[0].replace(/[.,;!?]+$/g, "");
-                if (!/^https?:\/\//i.test(url)) continue;
-
-                const hitItems = [item];
-                let lastItem = item;
-                while (url.endsWith("-")) {
-                    const continuation = textItems
-                        .filter(candidate =>
-                            !continuationItems.has(candidate) &&
-                            !hitItems.includes(candidate) &&
-                            Math.abs(candidate.transform[4] - lastItem.transform[4]) < 4 &&
-                            candidate.transform[5] < lastItem.transform[5] &&
-                            lastItem.transform[5] - candidate.transform[5] <= Math.max(lastItem.height * 1.8, 20) &&
-                            /^[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+$/.test(candidate.str.trim())
-                        )
-                        .sort((a, b) => b.transform[5] - a.transform[5])[0];
-                    if (!continuation) break;
-                    const continuationText = continuation.str.trim();
-                    url += continuationText;
-                    hitItems.push(continuation);
-                    continuationItems.add(continuation);
-                    lastItem = continuation;
-                }
-
-                for (const hitItem of hitItems) {
-                    const x1 = hitItem.transform[4];
-                    const y1 = hitItem.transform[5];
-                    const rect = [x1, y1, x1 + hitItem.width, y1 + hitItem.height];
-                    const [a, b, c, d, e, f] = viewport.transform;
-                    const corners = [
-                        [rect[0], rect[1]], [rect[0], rect[3]],
-                        [rect[2], rect[1]], [rect[2], rect[3]]
-                    ].map(([x, y]) => [a * x + c * y + e, b * x + d * y + f]);
-                    const left = Math.min(...corners.map(point => point[0]));
-                    const top = Math.min(...corners.map(point => point[1]));
-                    const width = Math.max(...corners.map(point => point[0])) - left;
-                    const height = Math.max(...corners.map(point => point[1])) - top;
-                    const urlLink = document.createElement("a");
-                    urlLink.className = "pdf-link";
-                    urlLink.href = url;
-                    urlLink.target = "_blank";
-                    urlLink.rel = "noopener noreferrer";
-                    urlLink.title = url;
-                    urlLink.setAttribute("aria-label", `Открыть внешний источник: ${url}`);
-                    urlLink.style.left = `${(left / viewport.width) * 100}%`;
-                    urlLink.style.top = `${(top / viewport.height) * 100}%`;
-                    urlLink.style.width = `${(width / viewport.width) * 100}%`;
-                    urlLink.style.height = `${(height / viewport.height) * 100}%`;
-                    for (const eventName of ["pointerdown", "mousedown", "touchstart"]) {
-                        urlLink.addEventListener(eventName, event => event.stopPropagation());
-                    }
-                    urlLink.addEventListener("click", event => event.stopPropagation());
-                    layer.appendChild(urlLink);
-                }
-            }
-        }
-
-        if (layer.childElementCount > 0) pageElement.appendChild(layer);
-        linkedPages.add(pageNumber);
-    }
-
-    async function renderRange(firstPage, lastPage) {
-        const first = Math.max(1, firstPage);
-        const last = Math.min(pdf.numPages, lastPage);
-        const jobs = [];
-        for (let pageNumber = first; pageNumber <= last; pageNumber++) {
-            jobs.push(renderPage(pageNumber));
-        }
-        await Promise.all(jobs);
-    }
-
-    function releaseDistantPages(currentPageNumber) {
-        const visiblePageCount = pageFlip.getOrientation() === "landscape" ? 2 : 1;
-        const firstKept = currentPageNumber;
-        const lastKept = Math.min(pdf.numPages, currentPageNumber + visiblePageCount - 1);
-        for (const pageNumber of [...renderedPages]) {
-            if (pageNumber < firstKept || pageNumber > lastKept) {
-                const canvas = canvases[pageNumber - 1];
-                canvas.width = 0;
-                canvas.height = 0;
-                renderedPages.delete(pageNumber);
-                pageProxies.get(pageNumber)?.cleanup();
-                pageProxies.delete(pageNumber);
-                const pageElement = canvas.parentElement;
-                pageElement.querySelector(".pdf-link-layer")?.remove();
-                linkedPages.delete(pageNumber);
-            }
-        }
-    }
-
-    // Render only the opening page before the flipbook is shown.
-    await renderRange(1, 1);
-
-    const pageFlip = new St.PageFlip(book, {
-        width: 550,
-        height: 733,
-        size: "stretch",
-        minWidth: 280,
-        maxWidth: 1000,
-        minHeight: 370,
-        maxHeight: 1333,
-        // Keep sheets flexible so they bend during a turn.
-        showCover: false,
-        drawShadow: true,
-        showPageCorners: true,
-        flippingTime: 1_250,
-        mobileScrollSupport: false,
-        usePortrait: true,
-        maxShadowOpacity: 0.85
-    });
-
-    pageFlip.loadFromHTML(document.querySelectorAll(".page"));
-
     const counter = document.getElementById("counter");
     const viewer = document.getElementById("viewer");
-    const soundButton = document.getElementById("sound-toggle");
+    const button = id => document.getElementById(id);
+    const reportError = error => {
+        console.error(error);
+        status.textContent = `Не удалось загрузить страницу: ${error.message}`;
+    };
+    status.textContent = "Загружаю данные книги…";
+    // Start the worker download while the manifest and first byte block load.
+    const worker = new pdfjsLib.PDFWorker();
+    const sourcePromise = openPdfSource(new URL("../book-data/manifest.json", import.meta.url));
+    const [source] = await Promise.all([sourcePromise, worker.promise]).catch(error => {
+        worker.destroy();
+        sourcePromise.then(source => source.range.abort()).catch(() => {});
+        throw error;
+    });
+    const loadingTask = pdfjsLib.getDocument({
+        worker,
+        range: source.range,
+        rangeChunkSize: source.chunkSize,
+        disableAutoFetch: true,
+        disableStream: true,
+        cMapUrl: new URL("cmaps/", runtimeUrl).href,
+        standardFontDataUrl: new URL("standard_fonts/", runtimeUrl).href,
+        wasmUrl: new URL("wasm/", runtimeUrl).href,
+        iccUrl: new URL("iccs/", runtimeUrl).href
+    });
+    source.range.onError = error => {
+        reportError(error);
+        loadingTask.destroy().finally(() => worker.destroy()).catch(console.error);
+    };
+    let pdf;
+    try {
+        pdf = await Promise.race([loadingTask.promise, source.failure]);
+    } catch (error) {
+        await loadingTask.destroy();
+        worker.destroy();
+        throw error;
+    }
+    status.textContent = "Открываю первые страницы…";
+
+    const canvases = [];
+    const pages = [];
+    const fragment = document.createDocumentFragment();
+    for (let number = 1; number <= pdf.numPages; number++) {
+        const page = document.createElement("div");
+        page.className = "page";
+        page.dataset.pageNumber = number;
+        const canvas = document.createElement("canvas");
+        canvas.width = canvas.height = 0;
+        page.appendChild(canvas);
+        fragment.appendChild(page);
+        canvases.push(canvas);
+        pages.push(page);
+    }
+    book.appendChild(fragment);
+    book.style.pointerEvents = "none";
+    const pageFlip = new St.PageFlip(book, {
+        width: 550, height: 733, size: "stretch",
+        minWidth: 280, maxWidth: 1000, minHeight: 370, maxHeight: 1333,
+        showCover: false, drawShadow: true, showPageCorners: true,
+        flippingTime: 900, mobileScrollSupport: false, usePortrait: true,
+        maxShadowOpacity: 0.85
+    });
+    pageFlip.loadFromHTML(pages);
+
+    let ready = false;
+    let navigating = false;
+    let state = "read";
+    let transitionPages = [];
     let zoom = 1;
+    let soundEnabled = true;
+    let sounds;
+    let soundIndex = 0;
 
-    async function prepareAroundCurrentPage() {
-        const currentPageNumber = pageFlip.getCurrentPageIndex() + 1;
-        const visiblePageCount = pageFlip.getOrientation() === "landscape" ? 2 : 1;
-        await renderRange(currentPageNumber, currentPageNumber + visiblePageCount - 1);
-        // An older render batch can finish after the reader has already moved.
-        // Keep its completion from clearing canvases for the newer page.
-        if (currentPageNumber !== pageFlip.getCurrentPageIndex() + 1) return;
-        releaseDistantPages(currentPageNumber);
+    const spreadSize = () => pageFlip.getOrientation() === "landscape" ? 2 : 1;
+    function spreadAt(index = pageFlip.getCurrentPageIndex()) {
+        const size = spreadSize();
+        const first = Math.floor(index / size) * size;
+        return Array.from({ length: size }, (_, i) => first + i + 1)
+            .filter(number => number > 0 && number <= pdf.numPages);
+    }
+    const renderer = createPageRenderer({
+        pdf, canvases,
+        getPageWidth: () => (pageFlip.getBoundsRect()?.pageWidth || 550) * zoom,
+        createLinks: (page, viewport, isActive) =>
+            createLinkLayer(pdf, page, viewport, index => navigate(index), isActive)
+    });
+    function syncPages() {
+        return renderer.setPages([...spreadAt(), ...transitionPages]);
+    }
+    function updateControls() {
+        const index = pageFlip.getCurrentPageIndex();
+        counter.textContent = `${index + 1} / ${pdf.numPages}`;
+        const busy = !ready || navigating || state !== "read";
+        button("first-page").disabled = button("previous-page").disabled = busy || index === 0;
+        button("last-page").disabled = button("next-page").disabled = busy || index + spreadSize() >= pdf.numPages;
+    }
+    function playSound() {
+        if (!soundEnabled) return;
+        // Don't compete with the first PDF requests for sound downloads.
+        sounds ??= Array.from({ length: 3 }, () => {
+            const audio = new Audio(new URL("../assets/sounds/turning-a-page.ogg", import.meta.url));
+            audio.preload = "none";
+            return audio;
+        });
+        const sound = sounds[soundIndex++ % sounds.length];
+        sound.pause();
+        sound.currentTime = 0;
+        sound.volume = 0.4;
+        sound.playbackRate = 0.94 + Math.random() * 0.12;
+        sound.play().catch(() => {});
     }
 
-    function updateCounter() {
-        counter.textContent =
-            `${pageFlip.getCurrentPageIndex() + 1} / ${pdf.numPages}`;
+    async function navigate(index, direction = 0) {
+        if (!ready || navigating || state !== "read" || index < 0 || index >= pdf.numPages) return;
+        navigating = true;
+        book.style.pointerEvents = "none";
+        updateControls();
+        transitionPages = spreadAt(index);
+        try {
+            await syncPages();
+            if (direction > 0) pageFlip.flipNext();
+            else if (direction < 0) pageFlip.flipPrev();
+            else pageFlip.turnToPage(index);
+            if (state === "read") {
+                transitionPages = [];
+                await syncPages();
+            }
+        } finally {
+            navigating = false;
+            book.style.pointerEvents = "";
+            updateControls();
+        }
     }
 
-    function updateZoom(nextZoom) {
-        zoom = Math.min(1.35, Math.max(0.75, nextZoom));
+    button("first-page").addEventListener("click", () => navigate(0).catch(reportError));
+    button("last-page").addEventListener("click", () => navigate(pdf.numPages - 1).catch(reportError));
+    button("previous-page").addEventListener("click", () =>
+        navigate(pageFlip.getCurrentPageIndex() - spreadSize(), -1).catch(reportError));
+    button("next-page").addEventListener("click", () =>
+        navigate(pageFlip.getCurrentPageIndex() + spreadSize(), 1).catch(reportError));
+
+    function updateZoom(delta) {
+        zoom = Math.min(1.35, Math.max(0.75, zoom + delta));
         book.style.transform = `translateZ(0) scale(${zoom})`;
+        syncPages().catch(reportError);
     }
-
-    document.getElementById("first-page").addEventListener("click", async () => {
-        await renderRange(1, 1);
-        pageFlip.turnToPage(0);
-    });
-
-    document.getElementById("previous-page").addEventListener("click", async () => {
-        const step = pageFlip.getOrientation() === "landscape" ? 2 : 1;
-        const targetIndex = pageFlip.getCurrentPageIndex() - step;
-        if (targetIndex < 0) return;
-        await renderRange(targetIndex + 1, targetIndex + step);
-        pageFlip.flipPrev();
-    });
-
-    document.getElementById("next-page").addEventListener("click", async () => {
-        const step = pageFlip.getOrientation() === "landscape" ? 2 : 1;
-        const targetIndex = pageFlip.getCurrentPageIndex() + step;
-        if (targetIndex >= pdf.numPages) return;
-        await renderRange(targetIndex + 1, targetIndex + step);
-        pageFlip.flipNext();
-    });
-
-    document.getElementById("last-page").addEventListener("click", async () => {
-        const visiblePageCount = pageFlip.getOrientation() === "landscape" ? 2 : 1;
-        const lastVisiblePage = pdf.numPages;
-        await renderRange(Math.max(1, lastVisiblePage - visiblePageCount + 1), lastVisiblePage);
-        pageFlip.turnToPage(pdf.numPages - 1);
-    });
-
-    document.getElementById("zoom-out").addEventListener("click", () => {
-        updateZoom(zoom - 0.1);
-    });
-
-    document.getElementById("zoom-in").addEventListener("click", () => {
-        updateZoom(zoom + 0.1);
-    });
-
-    soundButton.addEventListener("click", () => {
+    button("zoom-out").addEventListener("click", () => updateZoom(-0.1));
+    button("zoom-in").addEventListener("click", () => updateZoom(0.1));
+    button("sound-toggle").addEventListener("click", () => {
         soundEnabled = !soundEnabled;
-        if (!soundEnabled) {
-            pageTurnSounds.forEach(sound => {
-                sound.pause();
-                sound.currentTime = 0;
-            });
-        }
-        soundButton.setAttribute("aria-pressed", String(soundEnabled));
-        soundButton.title = soundEnabled ? "Выключить звук" : "Включить звук";
-        soundButton.setAttribute("aria-label", soundButton.title);
-        soundButton.textContent = soundEnabled ? "♬" : "♩";
+        if (!soundEnabled) sounds?.forEach(sound => sound.pause());
+        button("sound-toggle").setAttribute("aria-pressed", String(soundEnabled));
+        button("sound-toggle").title = soundEnabled ? "Выключить звук" : "Включить звук";
+        button("sound-toggle").setAttribute("aria-label", button("sound-toggle").title);
     });
-
-    document.getElementById("fullscreen").addEventListener("click", () => {
-        if (document.fullscreenElement) {
-            document.exitFullscreen();
-        } else {
-            viewer.requestFullscreen();
-        }
+    button("fullscreen").addEventListener("click", () => {
+        const action = document.fullscreenElement ? document.exitFullscreen() : viewer.requestFullscreen();
+        action.catch(reportError);
     });
-
-    document.addEventListener("fullscreenchange", () => {
-        pageFlip.update();
-    });
-
     document.addEventListener("keydown", event => {
-        if (event.target instanceof Element && event.target.closest("button")) return;
-        if (event.key === "ArrowLeft") {
-            document.getElementById("previous-page").click();
-        }
-        if (event.key === "ArrowRight") {
-            document.getElementById("next-page").click();
+        if (event.target instanceof Element && event.target.closest("button, a, input, textarea, [contenteditable]")) return;
+        if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+            event.preventDefault();
+            button(event.key === "ArrowLeft" ? "previous-page" : "next-page").click();
         }
     });
 
-    updateCounter();
-
+    // During a drag/corner preview, only the pages taking part in that turn join
+    // the visible spread. Drop them again if the reader cancels the gesture.
     pageFlip.on("changeState", event => {
-        if (event.data === "flipping") playPageTurnSound();
-    });
-
-    pageFlip.on("flip", () => {
-        updateCounter();
-        prepareAroundCurrentPage().catch(error => {
-            console.error("Не удалось подготовить страницы книги:", error);
+        state = event.data;
+        if (state === "flipping") playSound();
+        updateControls();
+        requestAnimationFrame(() => {
+            if (state === "read") {
+                transitionPages = [];
+            } else {
+                const direction = pageFlip.getFlipController().getCalculation()?.getDirection();
+                if (direction !== undefined) {
+                    const target = pageFlip.getCurrentPageIndex() + (direction === 0 ? 1 : -1) * spreadSize();
+                    transitionPages = target >= 0 && target < pdf.numPages ? spreadAt(target) : [];
+                }
+                // PageFlip clones the DOM for portrait turns; cloneNode omits
+                // canvas pixels, so copy the one visible page into that clone.
+                for (const page of book.querySelectorAll(".page")) {
+                    const sourceCanvas = canvases[Number(page.dataset.pageNumber) - 1];
+                    const clone = page.querySelector("canvas");
+                    if (clone && clone !== sourceCanvas && sourceCanvas?.width) {
+                        clone.width = sourceCanvas.width;
+                        clone.height = sourceCanvas.height;
+                        clone.getContext("2d").drawImage(sourceCanvas, 0, 0);
+                    }
+                }
+            }
+            syncPages().catch(reportError);
         });
     });
+    pageFlip.on("flip", () => { updateControls(); syncPages().catch(reportError); });
+    pageFlip.on("changeOrientation", () => { transitionPages = []; syncPages().catch(reportError); updateControls(); });
+    let resizeTimer;
+    function resize() {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => syncPages().catch(reportError), 150);
+    }
+    window.addEventListener("resize", resize);
+    document.addEventListener("fullscreenchange", () => { pageFlip.update(); resize(); });
 
+    await syncPages();
+    ready = true;
+    book.style.pointerEvents = "";
+    document.querySelectorAll(".toolbar button").forEach(control => { control.disabled = false; });
+    updateControls();
     status.textContent = `Готово к чтению · ${pdf.numPages} стр.`;
-    prepareAroundCurrentPage().catch(error => {
-        console.error("Не удалось подготовить страницы книги:", error);
-    });
 }
-
-startBook().catch(error => {
-    console.error(error);
-    document.getElementById("status").textContent = "Ошибка: " + error.message;
-});

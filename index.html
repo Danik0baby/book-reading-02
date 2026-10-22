@@ -4,7 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PDF Book</title>
-    <link rel="stylesheet" href="./css/style.css">
+    <link rel="stylesheet" href="./css/style.css?v=7">
+    <link rel="modulepreload" href="./vendor/pdfjs/6.4.299/pdf.min.mjs">
 </head>
 <body>
 <div id="viewer">
@@ -18,7 +19,7 @@
                 <span class="viewer-subtitle">Цифровой флипбук</span>
             </span>
         </div>
-        <span id="status">Загрузка книги…</span>
+        <span id="status" role="status">Загрузка книги…</span>
     </header>
 
     <main id="stage">
@@ -42,7 +43,7 @@
         <button id="fullscreen" type="button" title="На весь экран" aria-label="На весь экран"><svg viewBox="0 0 24 24"><path d="M8 4H4v4m12-4h4v4M4 16v4h4m12-4v4h-4"/></svg></button>
     </nav>
 </div>
-<script src="./js/page-flip.browser.js"></script>
-<script type="module" src="./js/app.js?v=6"></script>
+<script defer src="./js/page-flip.browser.js"></script>
+<script type="module" src="./js/bootstrap.js?v=7"></script>
 </body>
 </html>
