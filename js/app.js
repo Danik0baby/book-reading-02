@@ -34,7 +34,14 @@ async function startBook() {
     // preserved modification time is older than the cached version.
     const pdfUrl = new URL("./book/backend.pdf", window.location.href);
     pdfUrl.searchParams.set("reload", Date.now().toString());
-    const pdf = await pdfjsLib.getDocument({ url: pdfUrl.href }).promise;
+    // Ask the server for PDF byte ranges on demand. Streaming and automatic
+    // prefetching would otherwise download the whole document up front.
+    const pdf = await pdfjsLib.getDocument({
+        url: pdfUrl.href,
+        disableStream: true,
+        disableAutoFetch: true,
+        rangeChunkSize: 64 * 1024
+    }).promise;
     const status = document.getElementById("status");
     status.textContent = "Подготавливаю первые страницы…";
 
@@ -159,7 +166,7 @@ async function startBook() {
                 link.addEventListener("click", async event => {
                     event.preventDefault();
                     event.stopPropagation();
-                    await renderRange(destinationPage - 1, destinationPage + 4);
+                    await renderRange(destinationPage, destinationPage);
                     pageFlip.turnToPage(destinationPage - 1);
                     updateCounter();
                     prepareAroundCurrentPage().catch(error => {
@@ -251,8 +258,9 @@ async function startBook() {
     }
 
     function releaseDistantPages(currentPageNumber) {
-        const firstKept = Math.max(1, currentPageNumber - 1);
-        const lastKept = Math.min(pdf.numPages, currentPageNumber + 5);
+        const visiblePageCount = pageFlip.getOrientation() === "landscape" ? 2 : 1;
+        const firstKept = currentPageNumber;
+        const lastKept = Math.min(pdf.numPages, currentPageNumber + visiblePageCount - 1);
         for (const pageNumber of [...renderedPages]) {
             if (pageNumber < firstKept || pageNumber > lastKept) {
                 const canvas = canvases[pageNumber - 1];
@@ -263,8 +271,8 @@ async function startBook() {
         }
     }
 
-    // Prepare the opening spread and one spread ahead before first display.
-    await renderRange(1, Math.min(pdf.numPages, 4));
+    // Render only the opening page before the flipbook is shown.
+    await renderRange(1, 1);
 
     const pageFlip = new St.PageFlip(book, {
         width: 550,
@@ -293,7 +301,8 @@ async function startBook() {
 
     async function prepareAroundCurrentPage() {
         const currentPageNumber = pageFlip.getCurrentPageIndex() + 1;
-        await renderRange(currentPageNumber - 1, currentPageNumber + 5);
+        const visiblePageCount = pageFlip.getOrientation() === "landscape" ? 2 : 1;
+        await renderRange(currentPageNumber, currentPageNumber + visiblePageCount - 1);
         releaseDistantPages(currentPageNumber);
     }
 
@@ -308,7 +317,7 @@ async function startBook() {
     }
 
     document.getElementById("first-page").addEventListener("click", async () => {
-        await renderRange(1, Math.min(pdf.numPages, 2));
+        await renderRange(1, 1);
         pageFlip.turnToPage(0);
     });
 
@@ -316,7 +325,7 @@ async function startBook() {
         const step = pageFlip.getOrientation() === "landscape" ? 2 : 1;
         const targetIndex = pageFlip.getCurrentPageIndex() - step;
         if (targetIndex < 0) return;
-        await renderRange(targetIndex + 1, targetIndex + step + 1);
+        await renderRange(targetIndex + 1, targetIndex + step);
         pageFlip.flipPrev();
     });
 
@@ -324,12 +333,14 @@ async function startBook() {
         const step = pageFlip.getOrientation() === "landscape" ? 2 : 1;
         const targetIndex = pageFlip.getCurrentPageIndex() + step;
         if (targetIndex >= pdf.numPages) return;
-        await renderRange(targetIndex + 1, targetIndex + step + 1);
+        await renderRange(targetIndex + 1, targetIndex + step);
         pageFlip.flipNext();
     });
 
     document.getElementById("last-page").addEventListener("click", async () => {
-        await renderRange(Math.max(1, pdf.numPages - 1), pdf.numPages);
+        const visiblePageCount = pageFlip.getOrientation() === "landscape" ? 2 : 1;
+        const lastVisiblePage = pdf.numPages;
+        await renderRange(Math.max(1, lastVisiblePage - visiblePageCount + 1), lastVisiblePage);
         pageFlip.turnToPage(pdf.numPages - 1);
     });
 
