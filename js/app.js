@@ -30,18 +30,12 @@ async function startBook() {
         });
     }
 
-    // A per-load parameter prevents browsers from reusing a replaced PDF whose
-    // preserved modification time is older than the cached version.
+    // Cloudflare Pages handles cache validation with ETags. Keep a stable URL
+    // so the browser and edge cache can reuse the PDF between visits.
     const pdfUrl = new URL("./book/backend.pdf", window.location.href);
-    pdfUrl.searchParams.set("reload", Date.now().toString());
-    // Ask the server for PDF byte ranges on demand. Streaming and automatic
-    // prefetching would otherwise download the whole document up front.
-    const pdf = await pdfjsLib.getDocument({
-        url: pdfUrl.href,
-        disableStream: true,
-        disableAutoFetch: true,
-        rangeChunkSize: 64 * 1024
-    }).promise;
+    // Pages currently returns complete 200 responses to Range requests, so use
+    // PDF.js streaming and let it render pages progressively as data arrives.
+    const pdf = await pdfjsLib.getDocument({ url: pdfUrl.href }).promise;
     const status = document.getElementById("status");
     status.textContent = "Подготавливаю первые страницы…";
 
@@ -65,6 +59,7 @@ async function startBook() {
     const renderedPages = new Set();
     const renderJobs = new Map();
     const linkedPages = new Set();
+    const pageProxies = new Map();
 
     async function renderPage(pageNumber) {
         if (renderedPages.has(pageNumber)) return;
@@ -72,6 +67,7 @@ async function startBook() {
 
         const job = (async () => {
             const pdfPage = await pdf.getPage(pageNumber);
+            pageProxies.set(pageNumber, pdfPage);
             const viewport = pdfPage.getViewport({ scale: 1.5 });
             const canvas = canvases[pageNumber - 1];
             const context = canvas.getContext("2d");
@@ -267,6 +263,11 @@ async function startBook() {
                 canvas.width = 0;
                 canvas.height = 0;
                 renderedPages.delete(pageNumber);
+                pageProxies.get(pageNumber)?.cleanup();
+                pageProxies.delete(pageNumber);
+                const pageElement = canvas.parentElement;
+                pageElement.querySelector(".pdf-link-layer")?.remove();
+                linkedPages.delete(pageNumber);
             }
         }
     }
@@ -303,6 +304,9 @@ async function startBook() {
         const currentPageNumber = pageFlip.getCurrentPageIndex() + 1;
         const visiblePageCount = pageFlip.getOrientation() === "landscape" ? 2 : 1;
         await renderRange(currentPageNumber, currentPageNumber + visiblePageCount - 1);
+        // An older render batch can finish after the reader has already moved.
+        // Keep its completion from clearing canvases for the newer page.
+        if (currentPageNumber !== pageFlip.getCurrentPageIndex() + 1) return;
         releaseDistantPages(currentPageNumber);
     }
 
