@@ -33,10 +33,26 @@ async function startBook() {
     // Cloudflare Pages handles cache validation with ETags. Keep a stable URL
     // so the browser and edge cache can reuse the PDF between visits.
     const pdfUrl = new URL("./book/backend.pdf", window.location.href);
-    // Pages currently returns complete 200 responses to Range requests, so use
-    // PDF.js streaming and let it render pages progressively as data arrives.
-    const pdf = await pdfjsLib.getDocument({ url: pdfUrl.href }).promise;
     const status = document.getElementById("status");
+    status.textContent = "Загружаю PDF…";
+    const isCloudflarePages = window.location.hostname.endsWith(".pages.dev");
+    // Pages does not return 206 for Range requests. Use a normal stream there;
+    // local servers can use byte ranges and avoid fetching the whole PDF early.
+    const loadingTask = pdfjsLib.getDocument({
+        url: pdfUrl.href,
+        disableRange: isCloudflarePages,
+        disableStream: isCloudflarePages,
+        disableAutoFetch: !isCloudflarePages
+    });
+    loadingTask.onProgress = ({ loaded, total }) => {
+        if (total > 0) {
+            const percent = Math.min(100, Math.round((loaded / total) * 100));
+            status.textContent = `Загружаю PDF… ${percent}%`;
+        } else if (loaded > 0) {
+            status.textContent = `Загружаю PDF… ${Math.ceil(loaded / 1024)} КБ`;
+        }
+    };
+    const pdf = await loadingTask.promise;
     status.textContent = "Подготавливаю первые страницы…";
 
     const book = document.getElementById("book");
